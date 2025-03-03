@@ -1,6 +1,6 @@
 CC=$(CROSS_COMPILE)gcc
 
-default: writer
+all: writer
 	$(CC) -o writer writer.c
 
 clean:
