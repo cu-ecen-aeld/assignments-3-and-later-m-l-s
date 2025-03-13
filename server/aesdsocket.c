@@ -52,7 +52,6 @@ childhandler(int sig)
     (void)unlink(TMPFILE);
     syslog(LOG_DEBUG, "Caught signal, exiting");
     closelog();
-    printf("adios\n");
     exit(0);
 }
 
@@ -74,7 +73,11 @@ do_service(int sock)
     char namebuf[128];
     FILE *l_file;
     char buf[BUFSIZ*8];
+    int pid;
 
+    if ((pid = fork()) != 0) {
+        exit(0);
+    }
     if (listen(sock, 3) < 0) {
         perror("listen");
         exit(-1);
