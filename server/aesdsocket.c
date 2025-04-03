@@ -39,8 +39,6 @@ struct entry {
 
 LIST_HEAD(listhead, entry);
 
-static int nthreads;
-static int nlive;
 int sock = 0;
 int pid;
 pthread_mutex_t mut = PTHREAD_MUTEX_INITIALIZER;
@@ -120,13 +118,14 @@ handler(int sig)
     exit(0);
 }
 
+int retval;
 
 void *
 worker(void *arg)
 {
     struct entry *td = (struct entry *)arg;
     FILE *l_file;
-    char buf[BUFSIZ*8];
+    char buf[BUFSIZ*8];;
 
     if ((l_file = fdopen(td->sock_fd, "a+")) == NULL) {
         fprintf(stderr, "fdopen error on socket\n");
@@ -143,6 +142,8 @@ worker(void *arg)
         ;
     td->tstate = TS_DONE;
     pthread_mutex_unlock(&mut);
+    retval = 0;
+    return (void *)&retval;
 }
 
 void
@@ -184,6 +185,8 @@ doservice(int sock, int isdaemon)
     }
     LIST_INIT(&head);
     while (TRUE) {
+        bzero(&l_socklen, sizeof l_socklen);
+        bzero(&client, sizeof client);
         if ((l_sock = accept(sock, (struct sockaddr *)&client, &l_socklen)) < 0)  {
             perror("accept");
             exit(-1);
@@ -230,9 +233,6 @@ doservice(int sock, int isdaemon)
 
 int main(int argc, char *argv[])
 {
-    int nthreads = 10;
-    int livethreads = nthreads;
-    int i, j;
     struct sockaddr_in addr;
     int do_daemon = 0;   
 
