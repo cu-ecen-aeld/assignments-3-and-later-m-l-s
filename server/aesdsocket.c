@@ -9,21 +9,87 @@
 #include <syslog.h>
 #include <signal.h>
 #include <sys/wait.h>
-
+#include <sys/time.h>
+#include <time.h>
+#include <pthread.h>
+#include <sys/queue.h>
 
 #define SERVPORT 9000
 #define TRUE 1
 #define TMPFILE "/var/tmp/aesdsocketdata"
 #define _XOPEN_SOURCE 700
 
-/*
- * globals, at my age?
- */
 
- FILE *tmp_fp;
- int sock = 0;
- int pid;
+enum threadstate {
+    TS_ALIVE,
+    TS_DONE
+};
 
+struct tmpf {
+    FILE *tmp_fp;
+    pthread_mutex_t mutex;
+ } tmpf;
+
+struct entry {
+    pthread_t tid;
+    enum threadstate tstate;
+    int sock_fd;
+    LIST_ENTRY(entry) entries;
+};
+
+LIST_HEAD(listhead, entry);
+
+static int nthreads;
+static int nlive;
+int sock = 0;
+int pid;
+pthread_mutex_t mut = PTHREAD_MUTEX_INITIALIZER;
+
+
+void
+writetmpfile(char *str)
+{
+    pthread_mutex_lock(&tmpf.mutex);
+    fprintf(tmpf.tmp_fp, "%s", str);
+    fflush(tmpf.tmp_fp);
+    pthread_mutex_unlock(&tmpf.mutex);
+}
+
+void
+dotimestamp(int sig)
+{
+    time_t t;
+    struct tm *loc_time;
+    char timestr[64];
+
+    if (time(&t) < 0)  {
+        perror("time");
+        exit(-1);
+    }
+    if ((loc_time = localtime(&t)) == NULL) {
+        perror("localtime");
+        exit(-1);
+    }
+    (void)strftime(timestr, 64, "timestamp: %a, %d %b %Y %T %z\n", loc_time);
+    writetmpfile(timestr);
+
+}
+
+void
+setalarm(int secs)
+{
+    struct itimerval alarmtime;
+
+    alarmtime.it_interval.tv_sec = secs;
+    alarmtime.it_interval.tv_usec = 0;
+    alarmtime.it_value.tv_sec = secs;
+    alarmtime.it_value.tv_usec = 0;
+
+    if (setitimer(ITIMER_REAL, &alarmtime, NULL) < 0) {
+        perror("setitimer");
+        exit(-1);
+    }
+}
 
 void
 send_sockdata(FILE *fp)
@@ -44,11 +110,10 @@ send_sockdata(FILE *fp)
     return;
 }
 
-
 void
-childhandler(int sig)
+handler(int sig)
 {
-    fclose(tmp_fp);
+    fclose(tmpf.tmp_fp);
     (void)unlink(TMPFILE);
     syslog(LOG_DEBUG, "Caught signal, exiting");
     closelog();
@@ -56,77 +121,120 @@ childhandler(int sig)
 }
 
 
-void
-parenthandler(int sig)
+void *
+worker(void *arg)
 {
-    (void)kill(pid, sig);
+    struct entry *td = (struct entry *)arg;
+    FILE *l_file;
+    char buf[BUFSIZ*8];
+
+    if ((l_file = fdopen(td->sock_fd, "a+")) == NULL) {
+        fprintf(stderr, "fdopen error on socket\n");
+    } else {
+        bzero(buf, BUFSIZ);
+        while (fgets(buf, BUFSIZ*8, l_file) != 0)  {
+            printf("%s", buf);
+            writetmpfile(buf);
+            send_sockdata(l_file);
+            bzero(buf, BUFSIZ*8);
+        }
+    }
+    while (pthread_mutex_trylock(&mut) != 0)
+        ;
+    td->tstate = TS_DONE;
+    pthread_mutex_unlock(&mut);
 }
 
-
 void
-do_service(int sock)
+doservice(int sock, int isdaemon)
 {
-    int l_sock;
-
+    int pid;
     socklen_t l_socklen;
     struct sockaddr_in client;
     char namebuf[128];
-    FILE *l_file;
-    char buf[BUFSIZ*8];
-    int pid;
+    int l_sock;
+    struct entry *threaddata, *np;
+    struct listhead head;
+    
 
-    if ((pid = fork()) != 0) {
-        exit(0);
+    if (isdaemon == TRUE) {
+        pid = fork();
+        if (pid != 0)
+            exit(0);
+        pid = fork();
+        if (pid != 0)
+            exit(0);
+    }
+    setalarm(10);
+    if (signal(SIGALRM, dotimestamp) == SIG_ERR)  {
+        perror("SIGALRM");
+        exit(-1);
     }
     if (listen(sock, 3) < 0) {
         perror("listen");
         exit(-1);
     }
-    if (signal(SIGTERM, childhandler) == SIG_ERR) {
+    if (signal(SIGTERM, handler) == SIG_ERR) {
         perror("SIGTERM");
         exit(-1);
     }
-    if (signal(SIGINT, childhandler) == SIG_ERR)  {
+    if (signal(SIGINT, handler) == SIG_ERR)  {
         perror("SIGERR");
         exit(-1);
     }
-    bzero((char *)&client, sizeof client);
-    l_socklen = sizeof client;
-    if ((tmp_fp = fopen(TMPFILE, "w+")) == NULL)  {
-        perror("opening tmp file");
-        exit(-1);
-    }
+    LIST_INIT(&head);
     while (TRUE) {
         if ((l_sock = accept(sock, (struct sockaddr *)&client, &l_socklen)) < 0)  {
             perror("accept");
             exit(-1);
         }
-        syslog(LOG_DEBUG, "Accepted connection from %s", inet_ntop(AF_INET, (char *)&client.sin_addr, namebuf, 128));
-        if ((l_file = fdopen(l_sock, "a+")) == NULL) {
-            fprintf(stderr, "fdopen error on socket\n");
+        syslog(LOG_DEBUG, "Accepted connection from %s", inet_ntop(AF_INET, 
+            (char *)&client.sin_addr, namebuf, 128));
+        if ((threaddata = (struct entry *)malloc(sizeof(struct entry))) == (struct entry *)NULL)  {
+            fprintf(stderr, "malloc failure\n");
             break;
         }
-        bzero(buf, BUFSIZ);
-        while (fgets(buf, BUFSIZ*8, l_file) != 0)  {
-            printf("%s", buf);
-            fprintf(tmp_fp, "%s", buf);
-            fflush(tmp_fp);
-            send_sockdata(l_file);
-            bzero(buf, BUFSIZ*8);
+        threaddata->tstate = TS_ALIVE;
+        threaddata->sock_fd = l_sock;
+        (void)pthread_create(&threaddata->tid, NULL, worker, (void *)threaddata);
+        pthread_mutex_trylock(&mut);
+        LIST_INSERT_HEAD(&head, threaddata, entries);
+        pthread_mutex_unlock(&mut);
+        LIST_FOREACH(np, &head, entries) {
+            if (np->tstate == TS_DONE)  {
+                if (pthread_mutex_trylock(&mut) == 0)  {
+                    LIST_REMOVE(np, entries);
+                    pthread_mutex_unlock(&mut);
+                    if (pthread_join(np->tid, NULL) != 0)
+                        perror("pthread_join");
+                    free(np);
+                }                
+            }
         }
+        // if ((l_file = fdopen(l_sock, "a+")) == NULL) {
+        //     fprintf(stderr, "fdopen error on socket\n");
+        //     break;
+        // }
+        // bzero(buf, BUFSIZ);
+        // while (fgets(buf, BUFSIZ*8, l_file) != 0)  {
+        //     printf("%s", buf);
+        //     writetmpfile(buf);
+        //     send_sockdata(l_file);
+        //     bzero(buf, BUFSIZ*8);
+        // }
+
+        
     }
 }
 
 
-
-int
-main(int argc, char *argv[])
+int main(int argc, char *argv[])
 {
+    int nthreads = 10;
+    int livethreads = nthreads;
+    int i, j;
     struct sockaddr_in addr;
-    int do_daemon = 0;
-    // int pid;
-    int status;
-    
+    int do_daemon = 0;   
 
     if (argc == 2) {
         if (argv[1][0] == '-' && argv[1][1] == 'd') {
@@ -146,30 +254,31 @@ main(int argc, char *argv[])
         perror("socket");
         exit(-1);
     }
-
     if (bind(sock, (struct sockaddr *)&addr, sizeof addr) < 0) {
         perror("bind");
         exit(-1);
     }
-    if (do_daemon == 1) {
-        if ((pid = fork()) < 0)  {
-            perror("fork");
-            exit(-1);
-        }
-        if (pid == 0)  {
-            do_service(sock);
-        } else {
-            if (signal(SIGTERM, parenthandler) == SIG_ERR) {
-                perror("SIGTERM");
-                exit(-1);
-            }
-            if (signal(SIGINT, parenthandler) == SIG_ERR)  {
-                perror("SIGERR");
-                exit(-1);
-            }
-            wait(&status);
-            exit(0);
-        }
+    if ((tmpf.tmp_fp = fopen(TMPFILE, "w+")) == NULL)  {
+        perror("opening tmp file");
+        exit(-1);
     }
-    do_service(sock);
+    doservice(sock, do_daemon);
+
+    // for ( i = 0 ; i < nthreads ; i++ )  {
+
+
+    // }
+    // while (livethreads != 0)  {
+    //     LIST_FOREACH(np, &head, entries)  {
+    //         printf("thread 0x%lx, tstate = %d\n", np->tid, (int)np->tstate);
+    //         if (np->tstate = TS_DONE)  {
+    //             pthread_join(np->tid, NULL);
+    //             livethreads--;
+    //             LIST_REMOVE(np, entries);
+    //         }
+    //         pthread_mutex_unlock(&mut);
+    //     }
+    // }
+
+    exit(0);
 }
